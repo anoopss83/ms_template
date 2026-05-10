@@ -1,0 +1,985 @@
+package main
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strings"
+)
+
+var requiredDecisions = map[string]string{
+	"postgresql":   "Decision: PostgreSQL as Default Database",
+	"migrations":   "Decision: SQL-First Migrations via `golang-migrate`",
+	"gorm":         "Decision: GORM for Application Data Access",
+	"router":       "Decision: `chi` Router over `net/http`",
+	"openapi":      "Decision: OpenAPI for API Contract",
+	"testing":      "Decision: Unit Tests + BDD Component Tests",
+	"observability": "Decision: OpenTelemetry + `slog`",
+	"gitlab":       "Decision: GitLab CI Pipeline",
+	"docker":       "Decision: Multi-Stage Dockerfile, `scratch` Final Image",
+	"config":       "Decision: YAML Configuration with Environment Variable Overrides",
+	"makefile":     "Decision: `Makefile` for Common Tasks",
+}
+
+type generatorConfig struct {
+	serviceName string
+	decisions   string
+	outputDir   string
+	force       bool
+	verify      bool
+	verifyLevel string
+}
+
+type verificationStep struct {
+	name    string
+	command []string
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg := parseFlags()
+	scriptDir, err := executableDir()
+	if err != nil {
+		return err
+	}
+	workspaceDir := filepath.Dir(scriptDir)
+
+	decisionsPath := cfg.decisions
+	if decisionsPath == "" {
+		decisionsPath = filepath.Join(workspaceDir, "DECISIONS.md")
+	}
+	if err := validateDecisions(decisionsPath); err != nil {
+		return err
+	}
+
+	serviceName, displayName, err := normalizeServiceName(cfg.serviceName)
+	if err != nil {
+		return err
+	}
+
+	outputDir := cfg.outputDir
+	if outputDir == "" {
+		outputDir = filepath.Join(filepath.Dir(workspaceDir), serviceName)
+	}
+	if err := ensureWritableOutput(outputDir, cfg.force); err != nil {
+		return err
+	}
+
+	files := buildFileMap(serviceName, displayName)
+	for relativePath, content := range files {
+		if err := writeFile(outputDir, relativePath, content); err != nil {
+			return err
+		}
+	}
+
+	tidyMessage, err := runGoModTidy(outputDir)
+	if err != nil {
+		return err
+	}
+
+	verificationSummary := "Verification skipped."
+	if cfg.verify {
+		verificationSummary, err = runVerification(outputDir, serviceName, cfg.verifyLevel)
+		if err != nil {
+			return err
+		}
+	}
+
+	fmt.Printf("Generated microservice scaffold at: %s\n", outputDir)
+	fmt.Println("Created files:")
+	paths := make([]string, 0, len(files))
+	for path := range files {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		fmt.Printf("- %s\n", path)
+	}
+	if tidyMessage != "" {
+		fmt.Println(tidyMessage)
+	}
+	if verificationSummary != "" {
+		fmt.Println(verificationSummary)
+	}
+
+	return nil
+}
+
+func parseFlags() generatorConfig {
+	var cfg generatorConfig
+	flag.StringVar(&cfg.serviceName, "service-name", "", "Microservice name, for example payments-api.")
+	flag.StringVar(&cfg.decisions, "decisions", "", "Path to DECISIONS.md. Defaults to the workspace root beside this script.")
+	flag.StringVar(&cfg.outputDir, "output-dir", "", "Optional explicit output directory. Defaults to a sibling of the current ms_template directory.")
+	flag.BoolVar(&cfg.force, "force", false, "Overwrite an existing output directory.")
+	flag.BoolVar(&cfg.verify, "verify", true, "Run post-generation verification commands.")
+	flag.StringVar(&cfg.verifyLevel, "verify-level", "quick", "Verification depth: quick or full.")
+	flag.Parse()
+
+	if strings.TrimSpace(cfg.serviceName) == "" {
+		fmt.Fprintln(os.Stderr, "error: --service-name is required")
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	return cfg
+}
+
+func executableDir() (string, error) {
+	_, sourcePath, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", errors.New("could not determine generator source path")
+	}
+	resolvedPath, err := filepath.EvalSymlinks(sourcePath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Dir(resolvedPath), nil
+}
+
+func validateDecisions(path string) error {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("DECISIONS.md not found: %s", path)
+		}
+		return err
+	}
+
+	text := string(content)
+	missing := make([]string, 0)
+	for key, marker := range requiredDecisions {
+		if !strings.Contains(text, marker) {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("DECISIONS.md is missing required decisions: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func normalizeServiceName(raw string) (string, string, error) {
+	cleaned := strings.TrimSpace(strings.ToLower(raw))
+	re := regexp.MustCompile(`[^a-z0-9_-]+`)
+	cleaned = re.ReplaceAllString(cleaned, "-")
+	re = regexp.MustCompile(`[-_]{2,}`)
+	cleaned = strings.Trim(re.ReplaceAllString(cleaned, "-"), "-")
+	if cleaned == "" {
+		return "", "", errors.New("service name must contain letters or numbers")
+	}
+	parts := strings.Split(cleaned, "-")
+	for i, part := range parts {
+		parts[i] = strings.ToUpper(part[:1]) + part[1:]
+	}
+	return cleaned, strings.Join(parts, " "), nil
+}
+
+func ensureWritableOutput(outputDir string, force bool) error {
+	info, err := os.Stat(outputDir)
+	if err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("output path exists and is not a directory: %s", outputDir)
+		}
+		entries, readErr := os.ReadDir(outputDir)
+		if readErr != nil {
+			return readErr
+		}
+		if len(entries) > 0 && !force {
+			return fmt.Errorf("output directory already exists and is not empty: %s. Use --force to overwrite", outputDir)
+		}
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.MkdirAll(outputDir, 0o755)
+}
+
+func writeFile(baseDir, relativePath, content string) error {
+	path := filepath.Join(baseDir, relativePath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	trimmed := strings.TrimRight(content, "\n") + "\n"
+	return os.WriteFile(path, []byte(trimmed), 0o644)
+}
+
+func runGoModTidy(outputDir string) (string, error) {
+	goPath, err := exec.LookPath("go")
+	if err != nil {
+		return "warning: generated project was created without dependency resolution because `go` is not available; run `go mod tidy` inside the generated service.", nil
+	}
+
+	cmd := exec.Command(goPath, "mod", "tidy")
+	cmd.Dir = outputDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("go mod tidy failed in %s: %w\n%s", outputDir, err, strings.TrimSpace(string(output)))
+	}
+
+	return "Resolved dependency versions with `go mod tidy` during generation.", nil
+}
+
+func runVerification(outputDir, serviceName, verifyLevel string) (string, error) {
+	goPath, err := exec.LookPath("go")
+	if err != nil {
+		return "warning: verification skipped because `go` is not available.", nil
+	}
+
+	steps, err := verificationSteps(goPath, serviceName, verifyLevel)
+	if err != nil {
+		return "", err
+	}
+
+	completed := make([]string, 0, len(steps))
+	for _, step := range steps {
+		cmd := exec.Command(step.command[0], step.command[1:]...)
+		cmd.Dir = outputDir
+		output, runErr := cmd.CombinedOutput()
+		if runErr != nil {
+			return "", fmt.Errorf("verification failed at step %q: %w\n%s", step.name, runErr, strings.TrimSpace(string(output)))
+		}
+		completed = append(completed, step.name)
+	}
+
+	return fmt.Sprintf("Verification passed (%s): %s.", verifyLevel, strings.Join(completed, ", ")), nil
+}
+
+func verificationSteps(goPath, serviceName, verifyLevel string) ([]verificationStep, error) {
+	steps := []verificationStep{
+		{
+			name:    "unit tests",
+			command: []string{goPath, "test", "./..."},
+		},
+		{
+			name:    "service build",
+			command: []string{goPath, "build", "./cmd/" + serviceName},
+		},
+	}
+
+	switch verifyLevel {
+	case "quick":
+		return steps, nil
+	case "full":
+		return steps, nil
+	default:
+		return nil, fmt.Errorf("unsupported verify level %q; use quick or full", verifyLevel)
+	}
+}
+
+func renderTemplate(tpl string, values map[string]string) string {
+	replacements := []string{
+		"{{BT}}", "`",
+	}
+	for key, value := range values {
+		replacements = append(replacements, "{{"+key+"}}", value)
+	}
+	return strings.NewReplacer(replacements...).Replace(strings.TrimSpace(tpl))
+}
+
+func buildFileMap(serviceName, displayName string) map[string]string {
+	values := map[string]string{
+		"MODULE":       serviceName,
+		"SERVICE_NAME": serviceName,
+		"DISPLAY_NAME": displayName,
+	}
+
+	return map[string]string{
+		"go.mod":                                         renderTemplate(goModTemplate, values),
+		".gitignore":                                     renderTemplate(gitignoreTemplate, values),
+		"Makefile":                                       renderTemplate(makefileTemplate, values),
+		"Dockerfile":                                     renderTemplate(dockerfileTemplate, values),
+		"docker-compose.yml":                             renderTemplate(dockerComposeTemplate, values),
+		".gitlab-ci.yml":                                 renderTemplate(gitlabCITemplate, values),
+		"config/config.yaml":                             renderTemplate(configYAMLTemplate, values),
+		filepath.ToSlash(filepath.Join("cmd", serviceName, "main.go")): renderTemplate(mainTemplate, values),
+		"internal/config/config.go":                      renderTemplate(configGoTemplate, values),
+		"internal/observability/logger.go":               renderTemplate(observabilityTemplate, values),
+		"internal/httpserver/server.go":                  renderTemplate(httpServerTemplate, values),
+		"internal/users/users.go":                        renderTemplate(usersTemplate, values),
+		"internal/repository/user_repository.go":         renderTemplate(repositoryTemplate, values),
+		"db/migrations/001_create_users_table.up.sql":    renderTemplate(migrationUpTemplate, values),
+		"db/migrations/001_create_users_table.down.sql":  renderTemplate(migrationDownTemplate, values),
+		"features/users.feature":                         renderTemplate(featureTemplate, values),
+		"features/component_test.go":                     renderTemplate(componentTestTemplate, values),
+		"docs/openapi.yaml":                              renderTemplate(openAPITemplate, values),
+		"README.md":                                      renderTemplate(readmeTemplate, values),
+	}
+}
+
+const goModTemplate = `
+module {{MODULE}}
+
+go 1.22.0
+`
+
+const gitignoreTemplate = `
+.DS_Store
+bin/
+dist/
+.idea/
+.vscode/
+.env
+coverage.out
+test-results/
+`
+
+const makefileTemplate = `
+SERVICE_NAME := {{SERVICE_NAME}}
+APP_ENTRY := ./cmd/{{SERVICE_NAME}}
+
+.PHONY: help deps deps-update verify verify-full run test test-component fmt lint build docker-build db-up db-down
+
+help:
+	@echo "make deps           Resolve module dependencies"
+	@echo "make deps-update    Update dependencies to newer compatible versions"
+	@echo "make verify         Run quick post-generation verification"
+	@echo "make verify-full    Reserved for deeper verification"
+	@echo "make run            Run the service locally"
+	@echo "make test           Run unit tests"
+	@echo "make test-component Run component tests"
+	@echo "make fmt            Format source files"
+	@echo "make lint           Run vet as the default lint check"
+	@echo "make build          Build the service binary"
+	@echo "make docker-build   Build the container image"
+	@echo "make db-up          Start PostgreSQL"
+	@echo "make db-down        Stop PostgreSQL"
+
+deps:
+	go mod tidy
+
+deps-update:
+	go get -u ./...
+	go mod tidy
+
+verify:
+	go test ./...
+	go build $(APP_ENTRY)
+
+verify-full: verify
+
+run:
+	go run $(APP_ENTRY)
+
+test:
+	go test ./...
+
+test-component:
+	go test ./features/...
+
+fmt:
+	gofmt -w $(shell find . -name '*.go' -type f)
+
+lint:
+	go vet ./...
+
+build:
+	go build -o bin/$(SERVICE_NAME) $(APP_ENTRY)
+
+docker-build:
+	docker build -t $(SERVICE_NAME):local .
+
+db-up:
+	docker compose up -d postgres
+
+db-down:
+	docker compose down
+`
+
+const dockerfileTemplate = `
+FROM golang:1.22-alpine AS build
+WORKDIR /src
+COPY . .
+RUN go mod tidy
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/{{SERVICE_NAME}} ./cmd/{{SERVICE_NAME}}
+
+FROM scratch
+COPY --from=build /out/{{SERVICE_NAME}} /{{SERVICE_NAME}}
+EXPOSE 8080
+ENTRYPOINT ["/{{SERVICE_NAME}}"]
+`
+
+const dockerComposeTemplate = `
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  postgres-data:
+`
+
+const gitlabCITemplate = `
+stages:
+  - lint
+  - test
+  - build
+
+variables:
+  GO_VERSION: "1.22"
+  SERVICE_NAME: "{{SERVICE_NAME}}"
+
+lint:
+  stage: lint
+  image: golang:${GO_VERSION}
+  script:
+		- go mod tidy
+    - go fmt ./...
+    - go vet ./...
+
+test:
+  stage: test
+  image: golang:${GO_VERSION}
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB: app
+    POSTGRES_USER: app
+    POSTGRES_PASSWORD: app
+    DATABASE_URL: postgres://app:app@postgres:5432/app?sslmode=disable
+  script:
+		- go mod tidy
+    - go test ./...
+
+build:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  script:
+    - docker build -t $SERVICE_NAME:$CI_COMMIT_SHORT_SHA .
+`
+
+const configYAMLTemplate = `
+service:
+  name: {{SERVICE_NAME}}
+  environment: dev
+  http_port: 8080
+  tls_enabled: false
+  tls_cert_file: ""
+  tls_key_file: ""
+
+database:
+  host: localhost
+  port: 5432
+  name: app
+  user: app
+  password: app
+  sslmode: disable
+
+observability:
+  log_level: info
+  otel_endpoint: ""
+`
+
+const mainTemplate = `
+package main
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"{{MODULE}}/internal/config"
+	apphttp "{{MODULE}}/internal/httpserver"
+	"{{MODULE}}/internal/observability"
+	"{{MODULE}}/internal/repository"
+	"{{MODULE}}/internal/users"
+)
+
+func main() {
+	cfg, err := config.Load()
+	if err != nil {
+		panic(err)
+	}
+
+	logger := observability.NewLogger(cfg.Service.Name, cfg.Observability.LogLevel)
+	repo, err := repository.NewUserRepository(cfg.Database.DSN())
+	if err != nil {
+		logger.Error("failed to connect to database", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	handler := users.NewHandler(users.NewService(repo), logger)
+	server := apphttp.NewServer(cfg, logger, handler)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Start()
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil && err != http.ErrServerClosed {
+			logger.Error("server stopped with error", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Error("graceful shutdown failed", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+	}
+}
+`
+
+const configGoTemplate = `
+package config
+
+import (
+	"fmt"
+
+	"github.com/ilyakaznacheev/cleanenv"
+)
+
+type DatabaseConfig struct {
+	Host     string {{BT}}yaml:"host" env:"SERVICE_DATABASE_HOST" env-default:"localhost"{{BT}}
+	Port     int    {{BT}}yaml:"port" env:"SERVICE_DATABASE_PORT" env-default:"5432"{{BT}}
+	Name     string {{BT}}yaml:"name" env:"SERVICE_DATABASE_NAME" env-default:"app"{{BT}}
+	User     string {{BT}}yaml:"user" env:"SERVICE_DATABASE_USER" env-default:"app"{{BT}}
+	Password string {{BT}}yaml:"password" env:"SERVICE_DATABASE_PASSWORD" env-default:"app"{{BT}}
+	SSLMode  string {{BT}}yaml:"sslmode" env:"SERVICE_DATABASE_SSLMODE" env-default:"disable"{{BT}}
+}
+
+type Config struct {
+	Service struct {
+		Name        string {{BT}}yaml:"name" env:"SERVICE_NAME" env-default:"service"{{BT}}
+		Environment string {{BT}}yaml:"environment" env:"SERVICE_ENVIRONMENT" env-default:"dev"{{BT}}
+		HTTPPort    int    {{BT}}yaml:"http_port" env:"SERVICE_HTTP_PORT" env-default:"8080"{{BT}}
+		TLSEnabled  bool   {{BT}}yaml:"tls_enabled" env:"SERVICE_TLS_ENABLED" env-default:"false"{{BT}}
+		TLSCertFile string {{BT}}yaml:"tls_cert_file" env:"SERVICE_TLS_CERT_FILE"{{BT}}
+		TLSKeyFile  string {{BT}}yaml:"tls_key_file" env:"SERVICE_TLS_KEY_FILE"{{BT}}
+	} {{BT}}yaml:"service"{{BT}}
+	Database DatabaseConfig {{BT}}yaml:"database"{{BT}}
+	Observability struct {
+		LogLevel     string {{BT}}yaml:"log_level" env:"SERVICE_OBSERVABILITY_LOG_LEVEL" env-default:"info"{{BT}}
+		OTELEndpoint string {{BT}}yaml:"otel_endpoint" env:"SERVICE_OBSERVABILITY_OTEL_ENDPOINT"{{BT}}
+	} {{BT}}yaml:"observability"{{BT}}
+}
+
+func Load() (Config, error) {
+	var cfg Config
+	if err := cleanenv.ReadConfig("config/config.yaml", &cfg); err != nil {
+		return Config{}, err
+	}
+	if err := cleanenv.ReadEnv(&cfg); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+func (c Config) Address() string {
+	return fmt.Sprintf(":%d", c.Service.HTTPPort)
+}
+
+func (d DatabaseConfig) DSN() string {
+	return fmt.Sprintf(
+		"host=%s port=%d dbname=%s user=%s password=%s sslmode=%s",
+		d.Host,
+		d.Port,
+		d.Name,
+		d.User,
+		d.Password,
+		d.SSLMode,
+	)
+}
+`
+
+const observabilityTemplate = `
+package observability
+
+import (
+	"log/slog"
+	"os"
+	"strings"
+)
+
+func NewLogger(serviceName string, levelName string) *slog.Logger {
+	level := new(slog.LevelVar)
+	switch strings.ToLower(levelName) {
+	case "debug":
+		level.Set(slog.LevelDebug)
+	case "warn":
+		level.Set(slog.LevelWarn)
+	case "error":
+		level.Set(slog.LevelError)
+	default:
+		level.Set(slog.LevelInfo)
+	}
+
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})
+	return slog.New(handler).With(slog.String("service", serviceName))
+}
+`
+
+const httpServerTemplate = `
+package httpserver
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
+
+	"{{MODULE}}/internal/config"
+	"{{MODULE}}/internal/users"
+)
+
+type Server struct {
+	server *http.Server
+}
+
+func NewServer(cfg config.Config, logger *slog.Logger, handler *users.Handler) *Server {
+	router := chi.NewRouter()
+	router.Use(chimiddleware.RequestID)
+	router.Use(chimiddleware.RealIP)
+	router.Use(chimiddleware.Recoverer)
+	router.Use(requestLogger(logger))
+
+	router.Get("/health/live", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	router.Get("/health/ready", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	})
+
+	router.Route("/v1/users", func(r chi.Router) {
+		r.Get("/", handler.List)
+		r.Post("/", handler.Create)
+		r.Delete("/{id}", handler.Delete)
+	})
+
+	return &Server{
+		server: &http.Server{
+			Addr:              cfg.Address(),
+			Handler:           router,
+			ReadHeaderTimeout: 5 * time.Second,
+		},
+	}
+}
+
+func (s *Server) Start() error {
+	return s.server.ListenAndServe()
+}
+
+func (s *Server) Shutdown(ctx context.Context) error {
+	return s.server.Shutdown(ctx)
+}
+
+func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			started := time.Now()
+			next.ServeHTTP(w, r)
+			logger.Info("request completed",
+				slog.String("method", r.Method),
+				slog.String("path", r.URL.Path),
+				slog.String("request_id", chimiddleware.GetReqID(r.Context())),
+				slog.String("trace_id", ""),
+				slog.String("duration", time.Since(started).String()),
+			)
+		})
+	}
+}
+`
+
+const usersTemplate = `
+package users
+
+import (
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+)
+
+type User struct {
+	ID        string    {{BT}}json:"id"{{BT}}
+	Email     string    {{BT}}json:"email"{{BT}}
+	Name      string    {{BT}}json:"name"{{BT}}
+	CreatedAt time.Time {{BT}}json:"created_at"{{BT}}
+}
+
+type Repository interface {
+	List(rctx *http.Request) ([]User, error)
+	Create(rctx *http.Request, user User) (User, error)
+	Delete(rctx *http.Request, id string) error
+}
+
+type Service struct {
+	repo Repository
+}
+
+func NewService(repo Repository) *Service {
+	return &Service{repo: repo}
+}
+
+func (s *Service) List(r *http.Request) ([]User, error) {
+	return s.repo.List(r)
+}
+
+func (s *Service) Create(r *http.Request, email string, name string) (User, error) {
+	if email == "" || name == "" {
+		return User{}, errors.New("email and name are required")
+	}
+	user := User{
+		ID:        uuid.NewString(),
+		Email:     email,
+		Name:      name,
+		CreatedAt: time.Now().UTC(),
+	}
+	return s.repo.Create(r, user)
+}
+
+func (s *Service) Delete(r *http.Request, id string) error {
+	return s.repo.Delete(r, id)
+}
+
+type Handler struct {
+	service *Service
+	logger  *slog.Logger
+}
+
+func NewHandler(service *Service, logger *slog.Logger) *Handler {
+	return &Handler{service: service, logger: logger}
+}
+
+func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
+	users, err := h.service.List(r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, users)
+}
+
+func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Email string {{BT}}json:"email"{{BT}}
+		Name  string {{BT}}json:"name"{{BT}}
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "invalid request body")
+		return
+	}
+	user, err := h.service.Create(r, payload.Email, payload.Name)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, user)
+}
+
+func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "id is required")
+		return
+	}
+	if err := h.service.Delete(r, id); err != nil {
+		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeError(w http.ResponseWriter, status int, code string, message string) {
+	writeJSON(w, status, map[string]any{
+		"status": status,
+		"error": map[string]string{
+			"code":    code,
+			"message": message,
+		},
+	})
+}
+`
+
+const repositoryTemplate = `
+package repository
+
+import (
+	"net/http"
+	"time"
+
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+
+	"{{MODULE}}/internal/users"
+)
+
+type userRow struct {
+	ID        string    {{BT}}gorm:"column:id"{{BT}}
+	Email     string    {{BT}}gorm:"column:email"{{BT}}
+	Name      string    {{BT}}gorm:"column:name"{{BT}}
+	CreatedAt time.Time {{BT}}gorm:"column:created_at"{{BT}}
+}
+
+type UserRepository struct {
+	db *gorm.DB
+}
+
+func NewUserRepository(dsn string) (*UserRepository, error) {
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		return nil, err
+	}
+	return &UserRepository{db: db}, nil
+}
+
+func (r *UserRepository) List(_ *http.Request) ([]users.User, error) {
+	var records []userRow
+	if err := r.db.Table("users").Order("created_at desc").Find(&records).Error; err != nil {
+		return nil, err
+	}
+	result := make([]users.User, 0, len(records))
+	for _, record := range records {
+		result = append(result, users.User{
+			ID:        record.ID,
+			Email:     record.Email,
+			Name:      record.Name,
+			CreatedAt: record.CreatedAt,
+		})
+	}
+	return result, nil
+}
+
+func (r *UserRepository) Create(_ *http.Request, user users.User) (users.User, error) {
+	payload := map[string]any{
+		"id":         user.ID,
+		"email":      user.Email,
+		"name":       user.Name,
+		"created_at": user.CreatedAt,
+	}
+	if err := r.db.Table("users").Create(payload).Error; err != nil {
+		return users.User{}, err
+	}
+	return user, nil
+}
+
+func (r *UserRepository) Delete(_ *http.Request, id string) error {
+	return r.db.Table("users").Where("id = ?", id).Delete(nil).Error
+}
+`
+
+const migrationUpTemplate = `
+CREATE TABLE IF NOT EXISTS users (
+	id TEXT PRIMARY KEY,
+	email TEXT NOT NULL UNIQUE,
+	name TEXT NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+`
+
+const migrationDownTemplate = `
+DROP TABLE IF EXISTS users;
+`
+
+const featureTemplate = `
+Feature: users API
+  Scenario: create a user
+    Given the service is running
+    When I create a user named "Ada Lovelace" with email "ada@example.com"
+    Then the response status should be 201
+`
+
+const componentTestTemplate = `
+package features
+
+import "testing"
+
+func TestComponentScenarios(t *testing.T) {
+	t.Skip("wire godog and testcontainers-go scenarios for generated service")
+}
+`
+
+const openAPITemplate = `
+openapi: 3.0.3
+info:
+  title: {{DISPLAY_NAME}} API
+  version: 1.0.0
+paths:
+  /v1/users/:
+    get:
+      summary: List users
+      responses:
+        '200':
+          description: User list
+    post:
+      summary: Create user
+      responses:
+        '201':
+          description: User created
+  /health/live:
+    get:
+      summary: Liveness probe
+      responses:
+        '200':
+          description: Service is alive
+`
+
+const readmeTemplate = `
+# {{DISPLAY_NAME}}
+
+Generated from {{BT}}ms_template/DECISIONS.md{{BT}}.
+
+## Local development
+
+- {{BT}}make deps{{BT}} resolves dependencies for the current source tree.
+- {{BT}}make deps-update{{BT}} refreshes dependencies to newer compatible versions.
+- {{BT}}make db-up{{BT}} starts PostgreSQL.
+- {{BT}}make run{{BT}} starts the service.
+- {{BT}}make test{{BT}} runs unit tests.
+- {{BT}}make test-component{{BT}} runs component tests.
+
+## Key paths
+
+- {{BT}}cmd/{{SERVICE_NAME}}/main.go{{BT}} - service entry point
+- {{BT}}internal/{{BT}} - application code
+- {{BT}}db/migrations/{{BT}} - SQL migrations
+- {{BT}}features/{{BT}} - BDD component tests
+- {{BT}}docs/openapi.yaml{{BT}} - API contract
+`
