@@ -14,6 +14,7 @@ Workflow:
 
 Constraints:
 - Treat DECISIONS.md as the source of truth for the scaffold.
+- Generated code must follow DRY and SOLID principles as defined in DECISIONS.md.
 - Do not modify DECISIONS.md while generating a service.
 - Preserve existing output directories unless the user explicitly wants overwrite behavior.
 - Use the generated microservice name to derive directory name, module name, and display name.

@@ -14,17 +14,20 @@ import (
 )
 
 var requiredDecisions = map[string]string{
-	"postgresql":   "Decision: PostgreSQL as Default Database",
-	"migrations":   "Decision: SQL-First Migrations via `golang-migrate`",
-	"gorm":         "Decision: GORM for Application Data Access",
-	"router":       "Decision: `chi` Router over `net/http`",
-	"openapi":      "Decision: OpenAPI for API Contract",
-	"testing":      "Decision: Unit Tests + BDD Component Tests",
+	"postgresql":    "Decision: PostgreSQL as Default Database",
+	"migrations":    "Decision: SQL-First Migrations via `golang-migrate`",
+	"gorm":          "Decision: GORM for Application Data Access",
+	"router":        "Decision: `chi` Router over `net/http`",
+	"openapi":       "Decision: OpenAPI for API Contract",
+	"testing":       "Decision: Unit Tests + BDD Component Tests",
 	"observability": "Decision: OpenTelemetry + `slog`",
-	"gitlab":       "Decision: GitLab CI Pipeline",
-	"docker":       "Decision: Multi-Stage Dockerfile, `scratch` Final Image",
-	"config":       "Decision: YAML Configuration with Environment Variable Overrides",
-	"makefile":     "Decision: `Makefile` for Common Tasks",
+	"gitlab":        "Decision: GitLab CI Pipeline",
+	"docker":        "Decision: Multi-Stage Dockerfile, `scratch` Final Image",
+	"config":        "Decision: YAML Configuration with Environment Variable Overrides",
+	"makefile":      "Decision: `Makefile` for Common Tasks",
+	"principles":    "Decision: Engineering Principles (DRY and SOLID)",
+	"dry":           "Decision: DRY by Default in Shared Layers",
+	"solid":         "Decision: SOLID-Oriented Service Boundaries",
 }
 
 type generatorConfig struct {
@@ -166,9 +169,22 @@ func validateDecisions(path string) error {
 	}
 	if len(missing) > 0 {
 		sort.Strings(missing)
+		if missingContainsEngineeringPrinciples(missing) {
+			return fmt.Errorf("DECISIONS.md is missing required decisions: %s. Add the Engineering Principles section with DRY/SOLID markers before running the generator", strings.Join(missing, ", "))
+		}
 		return fmt.Errorf("DECISIONS.md is missing required decisions: %s", strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+func missingContainsEngineeringPrinciples(missing []string) bool {
+	for _, key := range missing {
+		switch key {
+		case "principles", "dry", "solid":
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeServiceName(raw string) (string, string, error) {
@@ -254,7 +270,67 @@ func runVerification(outputDir, serviceName, verifyLevel string) (string, error)
 		completed = append(completed, step.name)
 	}
 
+	if verifyLevel == "full" {
+		if err := verifyArchitectureLayout(outputDir, serviceName); err != nil {
+			return "", err
+		}
+		completed = append(completed, "architecture layout")
+	}
+
 	return fmt.Sprintf("Verification passed (%s): %s.", verifyLevel, strings.Join(completed, ", ")), nil
+}
+
+func verifyArchitectureLayout(outputDir, serviceName string) error {
+	requiredFiles := []string{
+		filepath.ToSlash(filepath.Join("cmd", serviceName, "main.go")),
+		"internal/config/config.go",
+		"internal/httpserver/server.go",
+		"internal/users/users.go",
+		"internal/repository/user_repository.go",
+		"db/migrations/001_create_users_table.up.sql",
+		"docs/openapi.yaml",
+	}
+
+	for _, relPath := range requiredFiles {
+		absPath := filepath.Join(outputDir, relPath)
+		if _, err := os.Stat(absPath); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("full verification failed: required layering file missing: %s", relPath)
+			}
+			return fmt.Errorf("full verification failed while checking %s: %w", relPath, err)
+		}
+	}
+
+	usersPath := filepath.Join(outputDir, "internal", "users", "users.go")
+	usersContent, err := os.ReadFile(usersPath)
+	if err != nil {
+		return fmt.Errorf("full verification failed while reading users layer: %w", err)
+	}
+	usersText := string(usersContent)
+	if !strings.Contains(usersText, "type Repository interface") {
+		return errors.New("full verification failed: users layer must depend on a repository interface")
+	}
+	if !strings.Contains(usersText, "type Service struct") {
+		return errors.New("full verification failed: users layer must define a service boundary")
+	}
+	if !strings.Contains(usersText, "func NewHandler") {
+		return errors.New("full verification failed: users layer must expose a handler constructor")
+	}
+
+	repositoryPath := filepath.Join(outputDir, "internal", "repository", "user_repository.go")
+	repositoryContent, err := os.ReadFile(repositoryPath)
+	if err != nil {
+		return fmt.Errorf("full verification failed while reading repository layer: %w", err)
+	}
+	repositoryText := string(repositoryContent)
+	if !strings.Contains(repositoryText, "package repository") {
+		return errors.New("full verification failed: repository implementation must stay isolated in internal/repository")
+	}
+	if !strings.Contains(repositoryText, "type UserRepository struct") {
+		return errors.New("full verification failed: repository layer must define a concrete repository implementation")
+	}
+
+	return nil
 }
 
 func verificationSteps(goPath, serviceName, verifyLevel string) ([]verificationStep, error) {
@@ -297,25 +373,25 @@ func buildFileMap(serviceName, displayName string) map[string]string {
 	}
 
 	return map[string]string{
-		"go.mod":                                         renderTemplate(goModTemplate, values),
-		".gitignore":                                     renderTemplate(gitignoreTemplate, values),
-		"Makefile":                                       renderTemplate(makefileTemplate, values),
-		"Dockerfile":                                     renderTemplate(dockerfileTemplate, values),
-		"docker-compose.yml":                             renderTemplate(dockerComposeTemplate, values),
-		".gitlab-ci.yml":                                 renderTemplate(gitlabCITemplate, values),
-		"config/config.yaml":                             renderTemplate(configYAMLTemplate, values),
+		"go.mod":             renderTemplate(goModTemplate, values),
+		".gitignore":         renderTemplate(gitignoreTemplate, values),
+		"Makefile":           renderTemplate(makefileTemplate, values),
+		"Dockerfile":         renderTemplate(dockerfileTemplate, values),
+		"docker-compose.yml": renderTemplate(dockerComposeTemplate, values),
+		".gitlab-ci.yml":     renderTemplate(gitlabCITemplate, values),
+		"config/config.yaml": renderTemplate(configYAMLTemplate, values),
 		filepath.ToSlash(filepath.Join("cmd", serviceName, "main.go")): renderTemplate(mainTemplate, values),
-		"internal/config/config.go":                      renderTemplate(configGoTemplate, values),
-		"internal/observability/logger.go":               renderTemplate(observabilityTemplate, values),
-		"internal/httpserver/server.go":                  renderTemplate(httpServerTemplate, values),
-		"internal/users/users.go":                        renderTemplate(usersTemplate, values),
-		"internal/repository/user_repository.go":         renderTemplate(repositoryTemplate, values),
-		"db/migrations/001_create_users_table.up.sql":    renderTemplate(migrationUpTemplate, values),
-		"db/migrations/001_create_users_table.down.sql":  renderTemplate(migrationDownTemplate, values),
-		"features/users.feature":                         renderTemplate(featureTemplate, values),
-		"features/component_test.go":                     renderTemplate(componentTestTemplate, values),
-		"docs/openapi.yaml":                              renderTemplate(openAPITemplate, values),
-		"README.md":                                      renderTemplate(readmeTemplate, values),
+		"internal/config/config.go":                                    renderTemplate(configGoTemplate, values),
+		"internal/observability/logger.go":                             renderTemplate(observabilityTemplate, values),
+		"internal/httpserver/server.go":                                renderTemplate(httpServerTemplate, values),
+		"internal/users/users.go":                                      renderTemplate(usersTemplate, values),
+		"internal/repository/user_repository.go":                       renderTemplate(repositoryTemplate, values),
+		"db/migrations/001_create_users_table.up.sql":                  renderTemplate(migrationUpTemplate, values),
+		"db/migrations/001_create_users_table.down.sql":                renderTemplate(migrationDownTemplate, values),
+		"features/users.feature":                                       renderTemplate(featureTemplate, values),
+		"features/component_test.go":                                   renderTemplate(componentTestTemplate, values),
+		"docs/openapi.yaml":                                            renderTemplate(openAPITemplate, values),
+		"README.md":                                                    renderTemplate(readmeTemplate, values),
 	}
 }
 

@@ -35,6 +35,7 @@ Workflow:
 - standard error envelope and domain error mapping
 - slog structured logging and OpenTelemetry hooks
 - YAML config with env overrides and file-based secrets pattern
+- DRY and SOLID engineering principles for layering and dependency boundaries
 - no gRPC, no event broker patterns
 5. Run verification when verify is true:
 - go fmt or equivalent formatting
@@ -52,11 +53,13 @@ Workflow:
 Hard constraints:
 - Treat [DECISIONS.md](DECISIONS.md) as source of truth for implementation choices.
 - Treat [Requirements.md](Requirements.md) as source of truth for acceptance checks.
+- Generated code must follow DRY and SOLID principles, especially at handler/service/repository boundaries.
 - Do not introduce alternate stacks unless explicitly requested by the user.
 - Do not modify decision or requirements documents during generation.
 
 Post-generation audit:
 - Compare generated output against decisions and requirements.
+- Confirm shared concerns are centralized (DRY) and responsibilities are layer-separated (SOLID).
 - List any drift with exact file-level fixes.
 - Apply fixes and report final compliance status.
 

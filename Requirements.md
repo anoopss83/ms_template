@@ -157,6 +157,9 @@ The template must:
 - The template must support automated formatting with `go fmt`.
 - The template must define a consistent approach for error handling using domain-specific error types that map to HTTP status codes.
 - The template must make dependency boundaries clear enough to support maintainable unit testing.
+- The template must minimize code duplication by centralizing shared concerns (middleware behavior, error mapping, and reusable persistence operations).
+- The template must enforce SOLID-oriented layering where handlers, services, and repositories each have a clear and limited responsibility.
+- The template must favor dependency inversion by allowing service logic to depend on focused interfaces instead of concrete storage details.
 - The template must include linting configuration references (not enforced, but provided for consistency).
 
 ### 8.3 Testing
@@ -202,6 +205,7 @@ The template will satisfy this requirements document when the following conditio
 - The generated service includes a minimal end-to-end sample resource demonstrating the full stack.
 - The generated service includes clear extension points for logs, metrics, and tracing via OpenTelemetry.
 - The generated service can pass automated formatting, linting, unit test, component test, and build checks in CI.
+- The generated service preserves DRY and SOLID-oriented boundaries through explicit layering and shared concerns in middleware/service/repository packages.
 - The template documentation clearly identifies mandatory capabilities, optional capabilities, and out-of-scope areas.
 - The template includes an OpenAPI specification documenting the sample resource.
 

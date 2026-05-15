@@ -271,6 +271,36 @@ Documented targets include:
 - The template includes a commented example of JWT middleware that services can enable or replace.
 - Authorization is left to handlers; the template does not prescribe a policy engine.
 
+## Engineering Principles
+
+### Decision: Engineering Principles (DRY and SOLID)
+
+**Rationale:** A reusable template must preserve maintainability as services evolve. Explicit engineering principles keep generated code coherent, reduce accidental complexity, and make extension work predictable across teams.
+
+**Implementation:**
+- Generated code must avoid avoidable duplication and centralize repeated logic in shared packages or helpers.
+- Package boundaries and interfaces must support single-responsibility design and clear dependency direction.
+- Validation, transport, domain logic, and persistence concerns must remain separated.
+
+### Decision: DRY by Default in Shared Layers
+
+**Rationale:** Repeated logic in handlers, middleware, and repositories increases bug surface and change cost. A template should model shared patterns once, then reuse them.
+
+**Implementation:**
+- Common HTTP behavior (request IDs, error mapping, panic recovery, structured logging) is implemented in middleware, not repeated per handler.
+- Reusable persistence behavior is centralized in repository methods instead of being duplicated across handlers.
+- Shared configuration and error translation logic is implemented once and consumed by all vertical slices.
+
+### Decision: SOLID-Oriented Service Boundaries
+
+**Rationale:** Services built from the template should be easy to extend without rewriting existing layers. SOLID-oriented boundaries provide stable extension points while minimizing coupling.
+
+**Implementation:**
+- **Single Responsibility:** Handlers orchestrate HTTP concerns, services handle business rules, repositories handle data access.
+- **Open/Closed:** New resources are added by composing new handlers/services/repositories rather than modifying unrelated modules.
+- **Liskov + Interface Segregation:** Interfaces should stay focused and behavior-preserving for mocks and test doubles.
+- **Dependency Inversion:** Business logic depends on abstractions (interfaces), not concrete storage or transport implementations.
+
 ## Excluded Capabilities
 
 The following are explicitly out of scope for this template version:
