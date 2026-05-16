@@ -42,6 +42,7 @@ type generatorConfig struct {
 type verificationStep struct {
 	name    string
 	command []string
+	env     []string
 }
 
 func main() {
@@ -263,6 +264,9 @@ func runVerification(outputDir, serviceName, verifyLevel string) (string, error)
 	for _, step := range steps {
 		cmd := exec.Command(step.command[0], step.command[1:]...)
 		cmd.Dir = outputDir
+		if len(step.env) > 0 {
+			cmd.Env = append(os.Environ(), step.env...)
+		}
 		output, runErr := cmd.CombinedOutput()
 		if runErr != nil {
 			return "", fmt.Errorf("verification failed at step %q: %w\n%s", step.name, runErr, strings.TrimSpace(string(output)))
@@ -349,6 +353,11 @@ func verificationSteps(goPath, serviceName, verifyLevel string) ([]verificationS
 	case "quick":
 		return steps, nil
 	case "full":
+		steps = append(steps, verificationStep{
+			name:    "component tests",
+			command: []string{goPath, "test", "./features/...", "-count=1"},
+			env:     []string{"ENABLE_COMPONENT_TESTS=1"},
+		})
 		return steps, nil
 	default:
 		return nil, fmt.Errorf("unsupported verify level %q; use quick or full", verifyLevel)
@@ -385,11 +394,17 @@ func buildFileMap(serviceName, displayName string) map[string]string {
 		"internal/observability/logger.go":                             renderTemplate(observabilityTemplate, values),
 		"internal/httpserver/server.go":                                renderTemplate(httpServerTemplate, values),
 		"internal/users/users.go":                                      renderTemplate(usersTemplate, values),
+		"internal/users/users_test.go":                                 renderTemplate(usersTestTemplate, values),
 		"internal/repository/user_repository.go":                       renderTemplate(repositoryTemplate, values),
+		"internal/repository/migrations.go":                            renderTemplate(repositoryMigrationsTemplate, values),
 		"db/migrations/001_create_users_table.up.sql":                  renderTemplate(migrationUpTemplate, values),
 		"db/migrations/001_create_users_table.down.sql":                renderTemplate(migrationDownTemplate, values),
+		"db/migrations/embed.go":                                       renderTemplate(migrationEmbedTemplate, values),
 		"features/users.feature":                                       renderTemplate(featureTemplate, values),
 		"features/component_test.go":                                   renderTemplate(componentTestTemplate, values),
+		"features/steps/component_suite.go":                            renderTemplate(componentSuiteTemplate, values),
+		"features/steps/user_steps.go":                                 renderTemplate(userStepsTemplate, values),
+		"features/steps/health_steps.go":                               renderTemplate(healthStepsTemplate, values),
 		"docs/openapi.yaml":                                            renderTemplate(openAPITemplate, values),
 		"README.md":                                                    renderTemplate(readmeTemplate, values),
 	}
@@ -415,6 +430,7 @@ test-results/
 const makefileTemplate = `
 SERVICE_NAME := {{SERVICE_NAME}}
 APP_ENTRY := ./cmd/{{SERVICE_NAME}}
+TAGS ?=
 
 .PHONY: help deps deps-update verify verify-full run test test-component fmt lint build docker-build db-up db-down
 
@@ -422,10 +438,10 @@ help:
 	@echo "make deps           Resolve module dependencies"
 	@echo "make deps-update    Update dependencies to newer compatible versions"
 	@echo "make verify         Run quick post-generation verification"
-	@echo "make verify-full    Reserved for deeper verification"
+	@echo "make verify-full    Run deeper verification including component tests"
 	@echo "make run            Run the service locally"
 	@echo "make test           Run unit tests"
-	@echo "make test-component Run component tests"
+	@echo "make test-component Run full component tests (optional: TAGS='@component')"
 	@echo "make fmt            Format source files"
 	@echo "make lint           Run vet as the default lint check"
 	@echo "make build          Build the service binary"
@@ -444,7 +460,9 @@ verify:
 	go test ./...
 	go build $(APP_ENTRY)
 
+
 verify-full: verify
+	ENABLE_COMPONENT_TESTS=1 COMPONENT_TAGS="$(TAGS)" go test ./features/... -count=1
 
 run:
 	go run $(APP_ENTRY)
@@ -453,7 +471,7 @@ test:
 	go test ./...
 
 test-component:
-	go test ./features/...
+	ENABLE_COMPONENT_TESTS=1 COMPONENT_TAGS="$(TAGS)" go test ./features/... -count=1
 
 fmt:
 	gofmt -w $(shell find . -name '*.go' -type f)
@@ -526,16 +544,15 @@ test:
   stage: test
   image: golang:${GO_VERSION}
   services:
-    - name: postgres:16-alpine
-      alias: postgres
+	- name: docker:27-dind
+	  alias: docker
   variables:
-    POSTGRES_DB: app
-    POSTGRES_USER: app
-    POSTGRES_PASSWORD: app
-    DATABASE_URL: postgres://app:app@postgres:5432/app?sslmode=disable
+	DOCKER_HOST: tcp://docker:2375
+	DOCKER_TLS_CERTDIR: ""
   script:
 		- go mod tidy
-    - go test ./...
+	- go test ./...
+	- ENABLE_COMPONENT_TESTS=1 go test ./features/... -count=1
 
 build:
   stage: build
@@ -580,6 +597,7 @@ import (
 	"syscall"
 	"time"
 
+	"{{MODULE}}/db/migrations"
 	"{{MODULE}}/internal/config"
 	apphttp "{{MODULE}}/internal/httpserver"
 	"{{MODULE}}/internal/observability"
@@ -594,14 +612,24 @@ func main() {
 	}
 
 	logger := observability.NewLogger(cfg.Service.Name, cfg.Observability.LogLevel)
+	if err := repository.RunMigrations(cfg.Database.DSN(), migrations.Files); err != nil {
+		logger.Error("failed to apply migrations", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
 	repo, err := repository.NewUserRepository(cfg.Database.DSN())
 	if err != nil {
 		logger.Error("failed to connect to database", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+	defer func() {
+		if closeErr := repo.Close(); closeErr != nil {
+			logger.Error("failed to close database", slog.String("error", closeErr.Error()))
+		}
+	}()
 
 	handler := users.NewHandler(users.NewService(repo), logger)
-	server := apphttp.NewServer(cfg, logger, handler)
+	server := apphttp.NewServer(cfg, logger, handler, repo)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -733,11 +761,25 @@ import (
 	"{{MODULE}}/internal/users"
 )
 
+type ReadinessChecker interface {
+	Ready(ctx context.Context) error
+}
+
 type Server struct {
 	server *http.Server
 }
 
-func NewServer(cfg config.Config, logger *slog.Logger, handler *users.Handler) *Server {
+func NewServer(cfg config.Config, logger *slog.Logger, handler *users.Handler, readiness ReadinessChecker) *Server {
+	return &Server{
+		server: &http.Server{
+			Addr:              cfg.Address(),
+			Handler:           NewHandler(logger, handler, readiness),
+			ReadHeaderTimeout: 5 * time.Second,
+		},
+	}
+}
+
+func NewHandler(logger *slog.Logger, handler *users.Handler, readiness ReadinessChecker) http.Handler {
 	router := chi.NewRouter()
 	router.Use(chimiddleware.RequestID)
 	router.Use(chimiddleware.RealIP)
@@ -748,7 +790,16 @@ func NewServer(cfg config.Config, logger *slog.Logger, handler *users.Handler) *
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	router.Get("/health/ready", func(w http.ResponseWriter, _ *http.Request) {
+	router.Get("/health/ready", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if readiness != nil {
+			if err := readiness.Ready(ctx); err != nil {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("not ready"))
+				return
+			}
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready"))
 	})
@@ -759,13 +810,7 @@ func NewServer(cfg config.Config, logger *slog.Logger, handler *users.Handler) *
 		r.Delete("/{id}", handler.Delete)
 	})
 
-	return &Server{
-		server: &http.Server{
-			Addr:              cfg.Address(),
-			Handler:           router,
-			ReadHeaderTimeout: 5 * time.Second,
-		},
-	}
+	return router
 }
 
 func (s *Server) Start() error {
@@ -799,7 +844,9 @@ package users
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net/mail"
 	"net/http"
 	"time"
 
@@ -813,6 +860,12 @@ type User struct {
 	Name      string    {{BT}}json:"name"{{BT}}
 	CreatedAt time.Time {{BT}}json:"created_at"{{BT}}
 }
+
+var (
+	ErrValidation = errors.New("validation failed")
+	ErrConflict   = errors.New("conflict")
+	ErrNotFound   = errors.New("not found")
+)
 
 type Repository interface {
 	List(rctx *http.Request) ([]User, error)
@@ -834,7 +887,10 @@ func (s *Service) List(r *http.Request) ([]User, error) {
 
 func (s *Service) Create(r *http.Request, email string, name string) (User, error) {
 	if email == "" || name == "" {
-		return User{}, errors.New("email and name are required")
+		return User{}, fmt.Errorf("%w: email and name are required", ErrValidation)
+	}
+	if _, err := mail.ParseAddress(email); err != nil {
+		return User{}, fmt.Errorf("%w: email must be a valid email address", ErrValidation)
 	}
 	user := User{
 		ID:        uuid.NewString(),
@@ -878,7 +934,14 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := h.service.Create(r, payload.Email, payload.Name)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		switch {
+		case errors.Is(err, ErrValidation):
+			writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		case errors.Is(err, ErrConflict):
+			writeError(w, http.StatusConflict, "CONFLICT", "user already exists")
+		default:
+			writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error")
+		}
 		return
 	}
 	writeJSON(w, http.StatusCreated, user)
@@ -891,7 +954,12 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.service.Delete(r, id); err != nil {
-		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+		switch {
+		case errors.Is(err, ErrNotFound):
+			writeError(w, http.StatusNotFound, "NOT_FOUND", "user not found")
+		default:
+			writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error")
+		}
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -918,9 +986,12 @@ const repositoryTemplate = `
 package repository
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
@@ -971,13 +1042,93 @@ func (r *UserRepository) Create(_ *http.Request, user users.User) (users.User, e
 		"created_at": user.CreatedAt,
 	}
 	if err := r.db.Table("users").Create(payload).Error; err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return users.User{}, users.ErrConflict
+		}
 		return users.User{}, err
 	}
 	return user, nil
 }
 
 func (r *UserRepository) Delete(_ *http.Request, id string) error {
-	return r.db.Table("users").Where("id = ?", id).Delete(nil).Error
+	result := r.db.Table("users").Where("id = ?", id).Delete(&userRow{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return users.ErrNotFound
+	}
+	return nil
+}
+
+func (r *UserRepository) Ready(ctx context.Context) error {
+	sqlDB, err := r.db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.PingContext(ctx)
+}
+
+func (r *UserRepository) Close() error {
+	sqlDB, err := r.db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Close()
+}
+
+func (r *UserRepository) TruncateUsers(ctx context.Context) error {
+	return r.db.WithContext(ctx).Exec("TRUNCATE TABLE users").Error
+}
+`
+
+const repositoryMigrationsTemplate = `
+package repository
+
+import (
+	"database/sql"
+	"embed"
+	"errors"
+	"fmt"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+	migrate "github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
+)
+
+func RunMigrations(dsn string, files embed.FS) error {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	sourceDriver, err := iofs.New(files, ".")
+	if err != nil {
+		return err
+	}
+
+	databaseDriver, err := postgres.WithInstance(db, &postgres.Config{})
+	if err != nil {
+		return err
+	}
+
+	migrationRunner, err := migrate.NewWithInstance("iofs", sourceDriver, "postgres", databaseDriver)
+	if err != nil {
+		return err
+	}
+
+	if err := migrationRunner.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return fmt.Errorf("apply migrations: %w", err)
+	}
+
+	sourceErr, databaseErr := migrationRunner.Close()
+	if sourceErr != nil {
+		return sourceErr
+	}
+	return databaseErr
 }
 `
 
@@ -994,21 +1145,553 @@ const migrationDownTemplate = `
 DROP TABLE IF EXISTS users;
 `
 
+const migrationEmbedTemplate = `
+package migrations
+
+import "embed"
+
+//go:embed *.sql
+var Files embed.FS
+`
+
 const featureTemplate = `
+@component
 Feature: users API
+	Scenario: liveness succeeds
+		Given the service is running
+		When I request the liveness endpoint
+		Then the response status should be 200
+
+	Scenario: readiness succeeds
+		Given the service is running
+		When I request the readiness endpoint
+		Then the response status should be 200
+
   Scenario: create a user
-    Given the service is running
-    When I create a user named "Ada Lovelace" with email "ada@example.com"
-    Then the response status should be 201
+		Given the service is running
+		When I create a user named "Ada Lovelace" with email "ada@example.com"
+		Then the response status should be 201
+		And the response body should contain name "Ada Lovelace"
+		And the response body should contain email "ada@example.com"
+
+	Scenario: list users includes created records
+		Given the service is running
+		When I create a user named "Ada Lovelace" with email "ada@example.com"
+		And I create a user named "Grace Hopper" with email "grace@example.com"
+		And I list users
+		Then the response status should be 200
+		And the response body should include user email "ada@example.com"
+		And the response body should include user email "grace@example.com"
+
+	Scenario: delete an existing user
+		Given the service is running
+		When I create a user named "Ada Lovelace" with email "ada@example.com"
+		And I remember the created user id
+		And I delete the remembered user
+		Then the response status should be 204
+		When I list users
+		Then the response status should be 200
+		And the response body should not include user email "ada@example.com"
+
+	Scenario: reject invalid create payloads
+		Given the service is running
+		When I create a user named "" with email "bad-email"
+		Then the response status should be 400
+		And the error code should be "VALIDATION_ERROR"
+
+	Scenario: reject duplicate emails
+		Given the service is running
+		When I create a user named "Ada Lovelace" with email "ada@example.com"
+		And I create a user named "Ada Lovelace" with email "ada@example.com"
+		Then the response status should be 409
+		And the error code should be "CONFLICT"
+
+	Scenario: delete returns not found for unknown users
+		Given the service is running
+		When I delete user with id "missing-user"
+		Then the response status should be 404
+		And the error code should be "NOT_FOUND"
 `
 
 const componentTestTemplate = `
 package features
 
-import "testing"
+import (
+	"os"
+	"testing"
+
+	"{{MODULE}}/features/steps"
+)
 
 func TestComponentScenarios(t *testing.T) {
-	t.Skip("wire godog and testcontainers-go scenarios for generated service")
+	if os.Getenv("ENABLE_COMPONENT_TESTS") != "1" {
+		t.Skip("component tests disabled; set ENABLE_COMPONENT_TESTS=1 to run them")
+	}
+	steps.RunComponentSuite(t)
+}
+`
+
+const componentSuiteTemplate = `
+package steps
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/cucumber/godog"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"{{MODULE}}/db/migrations"
+	apphttp "{{MODULE}}/internal/httpserver"
+	"{{MODULE}}/internal/repository"
+	"{{MODULE}}/internal/users"
+)
+
+type componentSuite struct {
+	t         *testing.T
+	ctx       context.Context
+	cancel    context.CancelFunc
+	container testcontainers.Container
+	repo      *repository.UserRepository
+	server    *httptest.Server
+	client    *http.Client
+	logBuffer bytes.Buffer
+
+	lastResponse   *http.Response
+	lastBody       []byte
+	rememberedUser string
+}
+
+func RunComponentSuite(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	suite := &componentSuite{
+		t:      t,
+		ctx:    ctx,
+		cancel: cancel,
+	}
+
+	if err := suite.start(); err != nil {
+		t.Fatalf("start component suite: %v", err)
+	}
+	defer suite.stop()
+
+	options := godog.Options{
+		Format:   "pretty",
+		Paths:    []string{"users.feature"},
+		TestingT: t,
+	}
+	if tags := strings.TrimSpace(os.Getenv("COMPONENT_TAGS")); tags != "" {
+		options.Tags = tags
+	}
+
+	status := godog.TestSuite{
+		Name:                "component",
+		ScenarioInitializer: suite.InitializeScenario,
+		Options:             &options,
+	}.Run()
+
+	if status != 0 {
+		suite.dumpLogs()
+		t.Fatalf("component scenarios failed with exit code %d", status)
+	}
+}
+
+func (s *componentSuite) start() error {
+	request := testcontainers.ContainerRequest{
+		Image:        "postgres:16-alpine",
+		ExposedPorts: []string{"5432/tcp"},
+		Env: map[string]string{
+			"POSTGRES_DB":       "app",
+			"POSTGRES_USER":     "app",
+			"POSTGRES_PASSWORD": "app",
+		},
+		WaitingFor: wait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(30 * time.Second),
+	}
+
+	container, err := testcontainers.GenericContainer(s.ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: request,
+		Started:          true,
+	})
+	if err != nil {
+		return fmt.Errorf("docker is required for component tests: %w", err)
+	}
+	s.container = container
+
+	dsn, err := s.databaseDSN()
+	if err != nil {
+		return err
+	}
+
+	if err := repository.RunMigrations(dsn, migrations.Files); err != nil {
+		return err
+	}
+
+	repo, err := repository.NewUserRepository(dsn)
+	if err != nil {
+		return err
+	}
+	s.repo = repo
+
+	logger := slog.New(slog.NewJSONHandler(&s.logBuffer, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	handler := users.NewHandler(users.NewService(repo), logger)
+	s.server = httptest.NewServer(apphttp.NewHandler(logger, handler, repo))
+	s.client = s.server.Client()
+	return nil
+}
+
+func (s *componentSuite) stop() {
+	if s.server != nil {
+		s.server.Close()
+	}
+	if s.repo != nil {
+		_ = s.repo.Close()
+	}
+	if s.container != nil {
+		_ = s.container.Terminate(s.ctx)
+	}
+	s.cancel()
+}
+
+func (s *componentSuite) InitializeScenario(sc *godog.ScenarioContext) {
+	sc.Before(func(ctx context.Context, _ *godog.Scenario) (context.Context, error) {
+		return ctx, s.resetScenario()
+	})
+
+	registerUserSteps(sc, s)
+	registerHealthSteps(sc, s)
+}
+
+func (s *componentSuite) resetScenario() error {
+	s.lastResponse = nil
+	s.lastBody = nil
+	s.rememberedUser = ""
+	return s.repo.TruncateUsers(s.ctx)
+}
+
+func (s *componentSuite) doRequest(method string, path string, body io.Reader) error {
+	if s.lastResponse != nil && s.lastResponse.Body != nil {
+		_ = s.lastResponse.Body.Close()
+	}
+	request, err := http.NewRequestWithContext(s.ctx, method, s.server.URL+path, body)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+
+	response, err := s.client.Do(request)
+	if err != nil {
+		return err
+	}
+	payload, err := io.ReadAll(response.Body)
+	if err != nil {
+		_ = response.Body.Close()
+		return err
+	}
+	_ = response.Body.Close()
+
+	s.lastResponse = response
+	s.lastBody = payload
+	return nil
+}
+
+func (s *componentSuite) parseResponseObject() (map[string]any, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(s.lastBody, &payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func (s *componentSuite) parseResponseArray() ([]map[string]any, error) {
+	var payload []map[string]any
+	if err := json.Unmarshal(s.lastBody, &payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func (s *componentSuite) databaseDSN() (string, error) {
+	host, err := s.container.Host(s.ctx)
+	if err != nil {
+		return "", err
+	}
+	port, err := s.container.MappedPort(s.ctx, "5432/tcp")
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("host=%s port=%s dbname=app user=app password=app sslmode=disable", host, port.Port()), nil
+}
+
+func (s *componentSuite) dumpLogs() {
+	if s.logBuffer.Len() > 0 {
+		s.t.Logf("service logs:\n%s", s.logBuffer.String())
+	}
+	if s.container == nil {
+		return
+	}
+	reader, err := s.container.Logs(s.ctx)
+	if err != nil {
+		s.t.Logf("read postgres logs: %v", err)
+		return
+	}
+	defer reader.Close()
+	payload, err := io.ReadAll(reader)
+	if err != nil {
+		s.t.Logf("read postgres logs payload: %v", err)
+		return
+	}
+	s.t.Logf("postgres logs:\n%s", string(payload))
+}
+`
+
+const userStepsTemplate = `
+package steps
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+
+	"github.com/cucumber/godog"
+)
+
+func registerUserSteps(sc *godog.ScenarioContext, suite *componentSuite) {
+	sc.Step(` + "`^the service is running$`" + `, suite.theServiceIsRunning)
+	sc.Step(` + "`^I create a user named \"([^\"]*)\" with email \"([^\"]*)\"$`" + `, suite.iCreateAUserNamedWithEmail)
+	sc.Step(` + "`^I list users$`" + `, suite.iListUsers)
+	sc.Step(` + "`^I remember the created user id$`" + `, suite.iRememberTheCreatedUserID)
+	sc.Step(` + "`^I delete the remembered user$`" + `, suite.iDeleteTheRememberedUser)
+	sc.Step(` + "`^I delete user with id \"([^\"]*)\"$`" + `, suite.iDeleteUserWithID)
+	sc.Step(` + "`^the response status should be (\\d+)$`" + `, suite.theResponseStatusShouldBe)
+	sc.Step(` + "`^the response body should contain name \"([^\"]*)\"$`" + `, suite.theResponseBodyShouldContainName)
+	sc.Step(` + "`^the response body should contain email \"([^\"]*)\"$`" + `, suite.theResponseBodyShouldContainEmail)
+	sc.Step(` + "`^the response body should include user email \"([^\"]*)\"$`" + `, suite.theResponseBodyShouldIncludeUserEmail)
+	sc.Step(` + "`^the response body should not include user email \"([^\"]*)\"$`" + `, suite.theResponseBodyShouldNotIncludeUserEmail)
+	sc.Step(` + "`^the error code should be \"([^\"]*)\"$`" + `, suite.theErrorCodeShouldBe)
+}
+
+func (s *componentSuite) theServiceIsRunning() error {
+	if s.server == nil {
+		return fmt.Errorf("service server is not running")
+	}
+	return nil
+}
+
+func (s *componentSuite) iCreateAUserNamedWithEmail(name string, email string) error {
+	payload, err := json.Marshal(map[string]string{
+		"name":  name,
+		"email": email,
+	})
+	if err != nil {
+		return err
+	}
+	return s.doRequest(http.MethodPost, "/v1/users/", bytes.NewReader(payload))
+}
+
+func (s *componentSuite) iListUsers() error {
+	return s.doRequest(http.MethodGet, "/v1/users/", nil)
+}
+
+func (s *componentSuite) iRememberTheCreatedUserID() error {
+	payload, err := s.parseResponseObject()
+	if err != nil {
+		return err
+	}
+	id, ok := payload["id"].(string)
+	if !ok || id == "" {
+		return fmt.Errorf("response body does not contain an id")
+	}
+	s.rememberedUser = id
+	return nil
+}
+
+func (s *componentSuite) iDeleteTheRememberedUser() error {
+	if s.rememberedUser == "" {
+		return fmt.Errorf("no remembered user id is available")
+	}
+	return s.iDeleteUserWithID(s.rememberedUser)
+}
+
+func (s *componentSuite) iDeleteUserWithID(id string) error {
+	return s.doRequest(http.MethodDelete, "/v1/users/"+id, nil)
+}
+
+func (s *componentSuite) theResponseStatusShouldBe(status int) error {
+	if s.lastResponse == nil {
+		return fmt.Errorf("no response is available")
+	}
+	if s.lastResponse.StatusCode != status {
+		return fmt.Errorf("expected status %d, got %d with body %s", status, s.lastResponse.StatusCode, string(s.lastBody))
+	}
+	return nil
+}
+
+func (s *componentSuite) theResponseBodyShouldContainName(name string) error {
+	payload, err := s.parseResponseObject()
+	if err != nil {
+		return err
+	}
+	if payload["name"] != name {
+		return fmt.Errorf("expected response name %q, got %v", name, payload["name"])
+	}
+	return nil
+}
+
+func (s *componentSuite) theResponseBodyShouldContainEmail(email string) error {
+	payload, err := s.parseResponseObject()
+	if err != nil {
+		return err
+	}
+	if payload["email"] != email {
+		return fmt.Errorf("expected response email %q, got %v", email, payload["email"])
+	}
+	return nil
+}
+
+func (s *componentSuite) theResponseBodyShouldIncludeUserEmail(email string) error {
+	users, err := s.parseResponseArray()
+	if err != nil {
+		return err
+	}
+	for _, entry := range users {
+		if entry["email"] == email {
+			return nil
+		}
+	}
+	return fmt.Errorf("response body does not include user email %q", email)
+}
+
+func (s *componentSuite) theResponseBodyShouldNotIncludeUserEmail(email string) error {
+	users, err := s.parseResponseArray()
+	if err != nil {
+		return err
+	}
+	for _, entry := range users {
+		if entry["email"] == email {
+			return fmt.Errorf("response body unexpectedly includes user email %q", email)
+		}
+	}
+	return nil
+}
+
+func (s *componentSuite) theErrorCodeShouldBe(code string) error {
+	payload, err := s.parseResponseObject()
+	if err != nil {
+		return err
+	}
+	errorPayload, ok := payload["error"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("response body does not contain an error object")
+	}
+	if errorPayload["code"] != code {
+		return fmt.Errorf("expected error code %q, got %v", code, errorPayload["code"])
+	}
+	return nil
+}
+`
+
+const healthStepsTemplate = `
+package steps
+
+import (
+	"net/http"
+
+	"github.com/cucumber/godog"
+)
+
+func registerHealthSteps(sc *godog.ScenarioContext, suite *componentSuite) {
+	sc.Step(` + "`^I request the liveness endpoint$`" + `, suite.iRequestTheLivenessEndpoint)
+	sc.Step(` + "`^I request the readiness endpoint$`" + `, suite.iRequestTheReadinessEndpoint)
+}
+
+func (s *componentSuite) iRequestTheLivenessEndpoint() error {
+	return s.doRequest(http.MethodGet, "/health/live", nil)
+}
+
+func (s *componentSuite) iRequestTheReadinessEndpoint() error {
+	return s.doRequest(http.MethodGet, "/health/ready", nil)
+}
+`
+
+const usersTestTemplate = `
+package users
+
+import (
+	"errors"
+	"net/http"
+	"testing"
+)
+
+type repositoryStub struct {
+	createFn func(rctx *http.Request, user User) (User, error)
+}
+
+func (r repositoryStub) List(_ *http.Request) ([]User, error) {
+	return nil, nil
+}
+
+func (r repositoryStub) Create(rctx *http.Request, user User) (User, error) {
+	if r.createFn != nil {
+		return r.createFn(rctx, user)
+	}
+	return user, nil
+}
+
+func (r repositoryStub) Delete(_ *http.Request, _ string) error {
+	return nil
+}
+
+func TestServiceCreateValidatesInput(t *testing.T) {
+	tests := []struct {
+		name  string
+		email string
+		user  string
+		err   error
+	}{
+		{name: "missing name", email: "ada@example.com", user: "", err: ErrValidation},
+		{name: "invalid email", email: "bad-email", user: "Ada", err: ErrValidation},
+	}
+
+	service := NewService(repositoryStub{})
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := service.Create(nil, test.email, test.user)
+			if !errors.Is(err, test.err) {
+				t.Fatalf("expected error %v, got %v", test.err, err)
+			}
+		})
+	}
+}
+
+func TestServiceCreateReturnsRepositoryErrors(t *testing.T) {
+	service := NewService(repositoryStub{
+		createFn: func(_ *http.Request, _ User) (User, error) {
+			return User{}, ErrConflict
+		},
+	})
+
+	_, err := service.Create(nil, "ada@example.com", "Ada Lovelace")
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected conflict error, got %v", err)
+	}
 }
 `
 
@@ -1026,15 +1709,52 @@ paths:
           description: User list
     post:
       summary: Create user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, name]
+              properties:
+                email:
+                  type: string
+                  format: email
+                name:
+                  type: string
       responses:
         '201':
           description: User created
+        '400':
+          description: Invalid create payload
+        '409':
+          description: Duplicate email conflict
+  /v1/users/{id}:
+    delete:
+      summary: Delete user
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: User deleted
+        '404':
+          description: User not found
   /health/live:
     get:
       summary: Liveness probe
       responses:
         '200':
           description: Service is alive
+  /health/ready:
+    get:
+      summary: Readiness probe
+      responses:
+        '200':
+          description: Service is ready
 `
 
 const readmeTemplate = `
@@ -1049,7 +1769,8 @@ Generated from {{BT}}ms_template/DECISIONS.md{{BT}}.
 - {{BT}}make db-up{{BT}} starts PostgreSQL.
 - {{BT}}make run{{BT}} starts the service.
 - {{BT}}make test{{BT}} runs unit tests.
-- {{BT}}make test-component{{BT}} runs component tests.
+- {{BT}}make test-component{{BT}} runs the full component suite. Docker must be available because the suite uses {{BT}}testcontainers-go{{BT}}.
+- Optional filtering: {{BT}}make test-component TAGS='@component'{{BT}}.
 
 ## Key paths
 
@@ -1058,4 +1779,10 @@ Generated from {{BT}}ms_template/DECISIONS.md{{BT}}.
 - {{BT}}db/migrations/{{BT}} - SQL migrations
 - {{BT}}features/{{BT}} - BDD component tests
 - {{BT}}docs/openapi.yaml{{BT}} - API contract
+
+## API semantics
+
+- Creating a user with invalid input returns {{BT}}400{{BT}} with the standard error envelope.
+- Creating a user with a duplicate email returns {{BT}}409{{BT}} with error code {{BT}}CONFLICT{{BT}}.
+- Deleting a missing user returns {{BT}}404{{BT}} with error code {{BT}}NOT_FOUND{{BT}}.
 `

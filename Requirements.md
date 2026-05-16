@@ -72,6 +72,7 @@ The template must:
 
 - The template must expose a liveness endpoint.
 - The template must expose a readiness endpoint that verifies database connectivity.
+- The template must demonstrate readiness success in generated component tests using the real database-backed startup path.
 - The template must support graceful shutdown for in-flight requests and resource cleanup including database connections.
 
 ### 6.4 Configuration
@@ -86,6 +87,7 @@ The template must:
 - The template must provide a baseline structure for versioned API paths.
 - The template must define a consistent error response approach for HTTP APIs in a standard envelope format.
 - The template must support request validation and explicit status code handling.
+- The sample `users` resource must document and implement explicit API semantics for validation errors, duplicate email conflicts (`409`), and delete of a missing user (`404`).
 - The template must include an OpenAPI 3.0 specification documenting the API contract.
 
 ### 6.6 Database Integration
@@ -115,6 +117,7 @@ The template must:
 - The template must support an automated path from source change to deployable artifact.
 - CI/CD requirements must be expressed through a concrete example implementation while remaining portable to other platforms.
 - The template includes a GitLab CI pipeline as the reference implementation; teams may adapt to GitHub Actions, Jenkins, or other systems.
+- The reference CI pipeline must support container-backed component tests by providing Docker access for `testcontainers-go`.
 
 ### 7.3 Observability
 
@@ -140,6 +143,7 @@ The template must:
 - The template must support local execution with minimal setup steps.
 - The template must document the commands required to run, test, and package the service.
 - The template must provide a Makefile with documented targets for common tasks (run, test, test-component, lint, fmt, build, docker-build, db-up, db-down).
+- `make test-component` must run the full generated component suite by default and support optional scenario filtering via a documented Makefile variable.
 - The template must support a predictable onboarding path for a new engineer.
 - The template must include Docker Compose configuration for running PostgreSQL in local development.
 
@@ -168,7 +172,12 @@ The template must:
 - The template must define how HTTP handlers and core service logic can be tested.
 - The template must support component-level tests that exercise real HTTP, real PostgreSQL (via testcontainers), and mocked external dependencies.
 - Component tests must use Gherkin-style scenarios via godog with feature files in `features/` and step definitions in `features/steps/`.
-- Test databases must be created, migrated, and cleaned up for each scenario.
+- The generated component-test harness must be fully wired and runnable, not placeholder-only.
+- Component tests must run the service in-process behind a real HTTP server and use the same migration-backed startup path as the generated service.
+- Component tests must use one shared PostgreSQL container per test run and clean database state between scenarios.
+- The default generated component scenarios must cover liveness success, readiness success, user creation, user listing, user deletion, invalid create requests, duplicate email conflicts, and delete of a missing user.
+- Assertions must validate status codes and scenario-relevant response elements without requiring strict full-body equality.
+- Component-test setup must fail fast with a clear error when Docker is unavailable.
 
 ### 8.4 Dependency Management
 
@@ -181,6 +190,7 @@ The template must:
 - The template must be accompanied by clear usage documentation including README, architecture diagrams, and a developer guide.
 - The template documentation must explain project structure, startup commands, configuration expectations, testing workflow, and packaging workflow.
 - The template documentation must describe required environment variables, optional capabilities, and out-of-scope areas.
+- The template documentation must explain component-test prerequisites, the default full-suite behavior, optional tag filtering, and the sample API error semantics.
 - The template must include an OpenAPI specification documenting the sample resource and API contract.
 
 ## 9. Optional Capabilities

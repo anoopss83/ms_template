@@ -21,6 +21,7 @@ This document details the specific technology choices, patterns, and design deci
 - Migrations live in `db/migrations/` directory.
 - Migration files follow the naming convention: `001_create_users_table.up.sql` and `001_create_users_table.down.sql`.
 - Migrations are applied during service startup via the migration runner.
+- Component tests use the same startup path so migration behavior is exercised the same way in runtime and test flows.
 - The template includes a `make db-up` and `make db-down` commands for local development.
 
 ### Decision: GORM for Application Data Access
@@ -84,6 +85,7 @@ This document details the specific technology choices, patterns, and design deci
 - Domain errors are defined as types that map to HTTP status codes via middleware.
 - A recovery middleware catches panics and returns a `500` error in the standard format.
 - The template includes an error package with common error types: `BadRequest`, `NotFound`, `Conflict`, `InternalError`.
+- The sample `users` resource uses `409 Conflict` for duplicate email, `404 Not Found` for delete of a missing user, and `400 Bad Request` for invalid create payloads.
 
 ## Testing
 
@@ -94,12 +96,18 @@ This document details the specific technology choices, patterns, and design deci
 **Implementation:**
 - Unit tests use standard Go testing with table-driven patterns.
 - Component tests use `godog` for Gherkin-style scenarios.
-- Component tests run against an in-process HTTP server with:
+- Component tests run against an in-process HTTP server via `httptest` with:
   - Real PostgreSQL instance spun up via `testcontainers-go`.
-  - External API dependencies mocked (e.g., third-party payment gateways, analytics).
+  - The same migration-backed startup path used by the generated service.
+  - A reusable harness that owns container lifecycle, HTTP client setup, response capture, and per-scenario cleanup.
+  - External API dependencies mocked when a generated service actually uses them; the sample `users` resource stays focused on database-backed behavior.
 - Feature files live in `features/` and follow naming convention: `users.feature`.
 - Step definitions live in `features/steps/` and are organized by domain.
-- Test database is created, migrated, and cleaned up for each scenario.
+- One PostgreSQL container is shared for the test run and database state is cleaned between scenarios.
+- The generated default scenarios cover liveness success, readiness success, user creation, user listing, user deletion, invalid create requests, duplicate email conflicts, and delete of a missing user.
+- Assertions focus on scenario-relevant status codes and response elements instead of strict full-body equality.
+- The component suite runs in full by default and supports optional tag filtering through the Makefile.
+- If Docker is unavailable, component tests fail fast with a clear explanatory error.
 
 ### Example Test Command
 ```bash
@@ -175,7 +183,7 @@ make test-component # Run component tests via godog
 **Implementation:**
 - `.gitlab-ci.yml` defines stages: lint, test, build.
 - **Lint stage:** runs `golangci-lint`, `go fmt`, and `go vet`.
-- **Test stage:** runs unit tests and component tests.
+- **Test stage:** runs unit tests and component tests with Docker access for `testcontainers-go`.
 - **Build stage:** builds the Docker image and (optionally) pushes to a registry.
 - CI/CD runs on every push and merge request.
 - Deployment is left to CD; the template does not prescribe deployment targets.
@@ -232,7 +240,7 @@ make test-component # Run component tests via godog
 Documented targets include:
 - `make run` — Run the service locally.
 - `make test` — Run unit tests.
-- `make test-component` — Run component tests.
+- `make test-component` — Run the full component suite by default, with optional tag filtering via a documented variable.
 - `make lint` — Run linting checks (for reference; teams configure independently).
 - `make fmt` — Format code.
 - `make build` — Build the binary.
@@ -246,9 +254,11 @@ Documented targets include:
 **Rationale:** Clear documentation accelerates onboarding and reduces support burden.
 
 **Implementation:**
-- **README.md:** Overview, local setup, commands, quick walkthrough of adding a new endpoint.
+
+- **README.md:** Overview, local setup, commands, component-test prerequisites, optional tag filtering, and quick walkthrough of adding a new endpoint.
 - **Architecture Diagram:** Visual representation of component relationships (in `docs/`).
 - **Developer Guide:** Detailed instructions on testing, debugging, and extending the template.
+- **OpenAPI:** Documents the sample resource success and error semantics enforced by the generated tests.
 
 ### Decision: Semantic Versioning for the Template
 
