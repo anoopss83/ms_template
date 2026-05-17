@@ -191,6 +191,7 @@ The template must:
 - The template documentation must explain project structure, startup commands, configuration expectations, testing workflow, and packaging workflow.
 - The template documentation must describe required environment variables, optional capabilities, and out-of-scope areas.
 - The template documentation must explain component-test prerequisites, the default full-suite behavior, optional tag filtering, and the sample API error semantics.
+- The generated repository must include a `.github/copilot-instructions.md` file that defines repository-specific coding rules and completion checks for Copilot-assisted changes.
 - The template must include an OpenAPI specification documenting the sample resource and API contract.
 
 ## 9. Optional Capabilities

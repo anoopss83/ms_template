@@ -258,6 +258,7 @@ Documented targets include:
 - **README.md:** Overview, local setup, commands, component-test prerequisites, optional tag filtering, and quick walkthrough of adding a new endpoint.
 - **Architecture Diagram:** Visual representation of component relationships (in `docs/`).
 - **Developer Guide:** Detailed instructions on testing, debugging, and extending the template.
+- **`.github/copilot-instructions.md`:** Repository-wide Copilot rules covering architecture boundaries, testing and documentation update obligations, and completion checklist expectations.
 - **OpenAPI:** Documents the sample resource success and error semantics enforced by the generated tests.
 
 ### Decision: Semantic Versioning for the Template

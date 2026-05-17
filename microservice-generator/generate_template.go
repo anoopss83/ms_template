@@ -406,6 +406,7 @@ func buildFileMap(serviceName, displayName string) map[string]string {
 		"features/steps/user_steps.go":                                 renderTemplate(userStepsTemplate, values),
 		"features/steps/health_steps.go":                               renderTemplate(healthStepsTemplate, values),
 		"docs/openapi.yaml":                                            renderTemplate(openAPITemplate, values),
+		".github/copilot-instructions.md":                             renderTemplate(copilotInstructionsTemplate, values),
 		"README.md":                                                    renderTemplate(readmeTemplate, values),
 	}
 }
@@ -1757,6 +1758,85 @@ paths:
           description: Service is ready
 `
 
+const copilotInstructionsTemplate = `
+# Copilot Instructions For {{DISPLAY_NAME}}
+
+These instructions define how Copilot should implement changes in this generated repository.
+
+## Non-Negotiable Rules
+
+1. Preserve architecture boundaries.
+	- Keep transport concerns in {{BT}}internal/httpserver{{BT}}.
+	- Keep business behavior in {{BT}}internal/users{{BT}} (or equivalent domain package).
+	- Keep persistence in {{BT}}internal/repository{{BT}}.
+	- Keep configuration in {{BT}}internal/config{{BT}}.
+	- Do not bypass service and repository boundaries by putting database logic in handlers.
+
+2. Keep the stack choices unless explicitly requested otherwise.
+	- Router/middleware: {{BT}}chi{{BT}}
+	- Data access: {{BT}}GORM{{BT}}
+	- Migrations: {{BT}}golang-migrate{{BT}} with SQL files
+	- Logging: {{BT}}slog{{BT}}
+	- Component tests: {{BT}}godog{{BT}} + {{BT}}testcontainers-go{{BT}}
+
+3. Use SQL-first schema changes only.
+	- Add migration files under {{BT}}db/migrations/{{BT}}.
+	- Do not use ORM auto-migrations as the source of truth.
+
+4. Keep documentation and contracts in sync with behavior.
+	- Update {{BT}}docs/openapi.yaml{{BT}} when endpoint behavior, payloads, or status codes change.
+	- Update {{BT}}README.md{{BT}} API semantics when user-visible behavior changes.
+
+5. Keep testing contract aligned with changes.
+	- Update BDD feature files and step definitions for API behavior changes.
+	- Do not rely on unit tests alone when behavior changes at API level.
+
+## Preferred Change Flow
+
+When developers provide requirements:
+
+1. Identify impacted layers first (handler, service, repository, migrations, tests, docs).
+2. Apply smallest coherent change set across all impacted layers.
+3. Keep status codes and error envelopes explicit and stable.
+4. Add or update component scenarios for the new behavior.
+5. Keep unit tests focused on pure business logic and error mapping.
+
+## Example Patterns
+
+1. If asked to add an endpoint:
+	- Add route in {{BT}}internal/httpserver/server.go{{BT}}.
+	- Add handler method in domain package.
+	- Add service behavior and repository operations.
+	- Add migrations if schema changes are needed.
+	- Add BDD scenarios and steps.
+	- Update OpenAPI and README.
+
+2. If asked to change a status code or error behavior:
+	- Update handler mapping logic.
+	- Update BDD scenarios and assertions.
+	- Update OpenAPI response section.
+	- Update README API semantics.
+
+3. If asked to add a new persisted field:
+	- Add SQL migration.
+	- Update model/repository mapping.
+	- Update validation and handler payloads.
+	- Update BDD scenario coverage.
+	- Update OpenAPI schemas.
+
+## Done Checklist
+
+Before considering work complete, ensure:
+
+1. Code changes are applied across all affected layers.
+2. BDD tests are updated for behavior changes.
+3. OpenAPI and README are updated for contract changes.
+4. Commands were run:
+	- {{BT}}go test ./...{{BT}}
+	- {{BT}}ENABLE_COMPONENT_TESTS=1 go test ./features/... -count=1{{BT}} when API behavior changed
+5. No unnecessary framework or architecture substitutions were introduced.
+`
+
 const readmeTemplate = `
 # {{DISPLAY_NAME}}
 
@@ -1779,6 +1859,7 @@ Generated from {{BT}}ms_template/DECISIONS.md{{BT}}.
 - {{BT}}db/migrations/{{BT}} - SQL migrations
 - {{BT}}features/{{BT}} - BDD component tests
 - {{BT}}docs/openapi.yaml{{BT}} - API contract
+- {{BT}}.github/copilot-instructions.md{{BT}} - repository-specific Copilot operating rules
 
 ## API semantics
 
